@@ -1,0 +1,17 @@
+﻿# Build outputs
+/build/
+**/CMakeFiles/
+**/CMakeCache.txt
+**/*.vcxproj*
+**/*.sln
+**/*.tlog
+
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Keep historical artifacts folder but ignore generated content
+legacy/src_core_build_legacy/
+legacy/src_release_legacy/
