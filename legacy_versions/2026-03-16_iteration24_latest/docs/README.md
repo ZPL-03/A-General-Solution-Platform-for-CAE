@@ -88,7 +88,7 @@ cd python/app
 python main_window.py
 ```
 
-详细安装指南请参考 **[docs/快速启动指南.md](docs/快速启动指南.md)**
+详细安装指南请参考 **[快速启动指南.md](快速启动指南.md)**
 
 ---
 
@@ -223,10 +223,10 @@ CAE_FEM_SOFTWARE/
 
 | 文档 | 说明 |
 |------|------|
-| [README.md](docs/README.md) | 项目总览(本文件) |
-| [快速启动指南.md](docs/快速启动指南.md) | 环境配置、编译、测试详细步骤 |
-| [CAE软件开发规划.md](docs/CAE软件开发规划.md) | 完整开发计划、技术路线、学习资源 |
-| [requirements.txt](docs/requirements.txt) | Python依赖包列表 |
+| [README.md](README.md) | 项目总览(本文件) |
+| [快速启动指南.md](快速启动指南.md) | 环境配置、编译、测试详细步骤 |
+| [CAE软件开发规划.md](CAE软件开发规划.md) | 完整开发计划、技术路线、学习资源 |
+| [requirements.txt](requirements.txt) | Python依赖包列表 |
 
 ---
 

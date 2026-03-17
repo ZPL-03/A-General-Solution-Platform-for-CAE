@@ -52,7 +52,7 @@
 **1. 克隆或下载项目**
 
 ```bash
-git clone https://github.com/ZPL-03/CAE_FEM_Software.git
+git clone https://github.com/ZPL-03/A-General-Solution-Platform-for-CAE.git CAE_FEM_Software
 cd CAE_FEM_Software
 ```
 
@@ -115,7 +115,6 @@ CAE_FEM_SOFTWARE/
 │       └── .gitkeep
 │
 ├── docs/                        # 项目文档
-│   ├── README.md                # 本文件
 │   ├── 快速启动指南.md           # 详细安装配置指南
 │   ├── CAE软件开发规划.md        # 完整开发规划
 │   └── requirements.txt         # Python依赖列表
@@ -129,7 +128,8 @@ CAE_FEM_SOFTWARE/
 │   └── fem_core.cp39-win_amd64.pyd      # 编译后的C++模块
 │
 ├── .gitignore                   # Git忽略文件配置
-└── CMakeLists.txt               # CMake项目配置文件
+├── CMakeLists.txt               # CMake项目配置文件
+└── README.md                    # 项目首页说明(本文件)
 ```
 
 ### 目录说明
@@ -223,7 +223,7 @@ CAE_FEM_SOFTWARE/
 
 | 文档 | 说明 |
 |------|------|
-| [README.md](docs/README.md) | 项目总览(本文件) |
+| [README.md](README.md) | 项目总览(本文件) |
 | [快速启动指南.md](docs/快速启动指南.md) | 环境配置、编译、测试详细步骤 |
 | [CAE软件开发规划.md](docs/CAE软件开发规划.md) | 完整开发计划、技术路线、学习资源 |
 | [requirements.txt](docs/requirements.txt) | Python依赖包列表 |
@@ -650,9 +650,9 @@ python -c "import gmsh; gmsh.initialize(); print('Gmsh版本:', gmsh.option.getS
 
 ## 📞 联系方式
 
-- **项目主页**: [https://github.com/ZPL-03/CAE_FEM_Software](https://github.com/ZPL-03/CAE_FEM_Software)
-- **问题反馈**: [Issues](https://github.com/ZPL-03/CAE_FEM_Software/issues)
-- **讨论交流**: [Discussions](https://github.com/ZPL-03/CAE_FEM_Software/discussions)
+- **项目主页**: [https://github.com/ZPL-03/A-General-Solution-Platform-for-CAE](https://github.com/ZPL-03/A-General-Solution-Platform-for-CAE)
+- **问题反馈**: [Issues](https://github.com/ZPL-03/A-General-Solution-Platform-for-CAE/issues)
+- **讨论交流**: [Discussions](https://github.com/ZPL-03/A-General-Solution-Platform-for-CAE/discussions)
 - **邮件**: 1370872708@qq.com
 
 ---

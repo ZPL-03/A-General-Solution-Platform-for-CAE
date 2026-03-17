@@ -846,7 +846,6 @@ CAE_FEM_SOFTWARE/
 │       └── *.csv                # 结果CSV文件
 │
 ├── docs/                        # 项目文档
-│   ├── README.md                # 项目总览
 │   ├── 快速启动指南.md           # 安装配置指南
 │   ├── CAE软件开发规划.md        # 本文件
 │   ├── requirements.txt         # Python依赖
@@ -866,7 +865,7 @@ CAE_FEM_SOFTWARE/
 ├── .gitattributes               # Git属性配置
 ├── CMakeLists.txt               # CMake顶层配置
 ├── LICENSE                      # MIT许可证
-└── README.md                    # 项目说明(符号链接到docs/README.md)
+└── README.md                    # 项目说明(GitHub首页)
 ```
 
 ### 5.2 CMakeLists.txt结构
@@ -1763,8 +1762,8 @@ Timeline (36周计划)
 
 ## 📞 联系与支持
 
-- **项目主页**: [https://github.com/ZPL-03/CAE_FEM_Software](https://github.com/ZPL-03/CAE_FEM_Software)
-- **问题反馈**: [GitHub Issues](https://github.com/ZPL-03/CAE_FEM_Software/issues)
+- **项目主页**: [https://github.com/ZPL-03/A-General-Solution-Platform-for-CAE](https://github.com/ZPL-03/A-General-Solution-Platform-for-CAE)
+- **问题反馈**: [GitHub Issues](https://github.com/ZPL-03/A-General-Solution-Platform-for-CAE/issues)
 - **开发者**: 刘正鹏
 - **邮箱**: 1370872708@qq.com
 - **机构**: 西安交通大学 固体力学专业
