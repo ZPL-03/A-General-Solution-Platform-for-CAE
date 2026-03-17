@@ -19,10 +19,6 @@ __pycache__/
 # 本地编辑器配置
 .vscode/
 
-# 仅本地查看，不上传到远程仓库
-AGENTS.md
-docs/CAE系统代码解读报告.md
-
 # 保留历史版本目录，但忽略其中生成的构建内容
 legacy/src_core_build_legacy/
 legacy/src_release_legacy/
