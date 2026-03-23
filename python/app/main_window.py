@@ -11,7 +11,7 @@ import time
 import traceback
 import warnings
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 # Windows 下嵌入 VTK 视口时，先关闭 MSAA，降低部分显卡驱动在首帧创建时卡死的概率。
 if sys.platform.startswith("win"):
@@ -28,23 +28,141 @@ import pyvista as pv
 import vtk
 from pyvistaqt import QtInteractor
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-PYTHON_ROOT = PROJECT_ROOT / "python"
-if str(PYTHON_ROOT) not in sys.path:
-    sys.path.insert(0, str(PYTHON_ROOT))
+# 先把源码模式下的 `python/` 目录加入搜索路径，
+# 这样当前文件既可以直接作为脚本运行，也可以在打包后继续复用同一套导入逻辑。
+SOURCE_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+SOURCE_PYTHON_ROOT = SOURCE_PROJECT_ROOT / "python"
+if str(SOURCE_PYTHON_ROOT) not in sys.path:
+    sys.path.insert(0, str(SOURCE_PYTHON_ROOT))
 
 from app.models import MeshSummary, ProjectState, ResultSummary
+from app.runtime_paths import APP_ROOT, DATA_DIR, MODELS_DIR, RESULTS_DIR, bootstrap_runtime_environment
 from app.services.mesh_service import MeshBundle, MeshQualityBundle, PreviewSceneData, build_geometry_preview, compute_mesh_quality, export_mesh_to_vtk, generate_volume_mesh
-from app.services.report_service import build_markdown_report
-from app.services.solver_service import (
-    AnalysisArtifacts,
-    describe_dynamic_damping,
-    get_solver_caption_for_analysis,
-    get_solver_hint_for_analysis,
-    get_solver_options_for_analysis,
-    normalize_solver_for_analysis,
-    run_linear_static_analysis,
-)
+
+bootstrap_runtime_environment()
+PROJECT_ROOT = APP_ROOT
+PYTHON_ROOT = PROJECT_ROOT / "python"
+STARTUP_TRACE_ENABLED = os.environ.get("CAE_STARTUP_TRACE", "0") == "1"
+SKIP_VIEWPORT_INIT = os.environ.get("CAE_SKIP_VIEWPORT_INIT", "0") == "1"
+SKIP_AUTO_PREVIEW = os.environ.get("CAE_SKIP_AUTO_PREVIEW", "0") == "1"
+
+
+def write_startup_trace(message: str) -> None:
+    """
+    在软件目录中记录启动轨迹。
+    说明：
+    1. 只在显式设置 `CAE_STARTUP_TRACE=1` 时启用；
+    2. 用于定位打包版的原生崩溃发生在启动流程的哪一步；
+    3. 每次写入都立即刷新到磁盘，避免进程崩溃后轨迹丢失。
+    """
+
+    if not STARTUP_TRACE_ENABLED:
+        return
+
+    trace_file = APP_ROOT / "startup_trace.log"
+    trace_file.parent.mkdir(parents=True, exist_ok=True)
+    with trace_file.open("a", encoding="utf-8") as handle:
+        handle.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} | {message}\n")
+        handle.flush()
+
+
+if TYPE_CHECKING:
+    from app.services.solver_service import AnalysisArtifacts
+
+
+def build_markdown_report(state: ProjectState, analysis_label: str, solver_label: str) -> str:
+    """
+    延迟导入报告服务。
+    说明：
+    1. 报告导出不是启动关键路径；
+    2. 这样可以避免主窗口导入时顺带触发 `solver_service`；
+    3. 有助于降低打包版启动阶段的原生模块加载压力。
+    """
+
+    from app.services.report_service import build_markdown_report as _build_markdown_report
+
+    return _build_markdown_report(state, analysis_label, solver_label)
+
+
+def _solver_service():
+    """延迟导入求解服务模块，避免主窗口启动时立刻加载 `fem_core`。"""
+
+    from app.services import solver_service
+
+    return solver_service
+
+
+def describe_dynamic_damping(state: ProjectState) -> str:
+    """延迟转发到求解服务中的阻尼描述函数。"""
+
+    return _solver_service().describe_dynamic_damping(state)
+
+
+GENERIC_LINEAR_SOLVER_OPTIONS = [
+    ("SparseLU 直接法", "sparse_lu"),
+    ("Conjugate Gradient", "conjugate_gradient"),
+    ("BiCGSTAB", "bicgstab"),
+]
+
+ANALYSIS_SOLVER_OPTIONS = {
+    "linear_static": GENERIC_LINEAR_SOLVER_OPTIONS,
+    "nonlinear_static": GENERIC_LINEAR_SOLVER_OPTIONS,
+    "transient_dynamic": GENERIC_LINEAR_SOLVER_OPTIONS,
+    "steady_state_thermal": GENERIC_LINEAR_SOLVER_OPTIONS,
+    "modal_analysis": [("内置广义特征值求解器", "modal_eigensolver")],
+    "frequency_response": [("内置复数直接频响法", "harmonic_direct")],
+}
+
+ANALYSIS_SOLVER_CAPTIONS = {
+    "linear_static": "线性求解器：",
+    "nonlinear_static": "线性求解器：",
+    "transient_dynamic": "线性求解器：",
+    "steady_state_thermal": "热方程求解器：",
+    "modal_analysis": "模态求解器：",
+    "frequency_response": "频响求解算法：",
+}
+
+ANALYSIS_SOLVER_HINTS = {
+    "linear_static": "当前分析步会使用所选稀疏线性求解器。",
+    "nonlinear_static": "非线性每次迭代都要求解线性切线方程组，因此这里的求解器会实际参与计算。",
+    "transient_dynamic": "瞬态动力学每个时间步都会组装并求解实数方程组，因此这里的求解器会实际参与计算。",
+    "steady_state_thermal": "稳态热传导会组装并求解标量热传导方程，因此这里的求解器会实际参与计算。",
+    "modal_analysis": "模态分析使用内置广义特征值求解器，线性方程组求解器不会参与本步计算。",
+    "frequency_response": "频响分析当前使用内置复数直接频响法，线性方程组求解器不会参与本步计算。",
+}
+
+
+def get_solver_caption_for_analysis(analysis_type: str) -> str:
+    """返回指定分析步对应的求解器标题。"""
+
+    return ANALYSIS_SOLVER_CAPTIONS.get(analysis_type, "线性求解器：")
+
+
+def get_solver_hint_for_analysis(analysis_type: str) -> str:
+    """返回指定分析步对应的求解器提示。"""
+
+    return ANALYSIS_SOLVER_HINTS.get(analysis_type, "当前分析步将使用所选求解器配置。")
+
+
+def get_solver_options_for_analysis(analysis_type: str) -> list[tuple[str, str]]:
+    """返回指定分析步允许的求解器选项。"""
+
+    return list(ANALYSIS_SOLVER_OPTIONS.get(analysis_type, GENERIC_LINEAR_SOLVER_OPTIONS))
+
+
+def normalize_solver_for_analysis(analysis_type: str, solver_name: str) -> str:
+    """把求解器值约束到当前分析步允许的集合中。"""
+
+    allowed_values = [value for _label, value in get_solver_options_for_analysis(analysis_type)]
+    if solver_name in allowed_values:
+        return solver_name
+    return allowed_values[0]
+
+
+def run_linear_static_analysis(mesh_bundle: MeshBundle, state: ProjectState):
+    """延迟转发到求解服务中的分析执行函数。"""
+
+    return _solver_service().run_linear_static_analysis(mesh_bundle, state)
 
 FACE_ITEMS = [("X 最小端面", "xmin"), ("X 最大端面", "xmax"), ("Y 最小端面", "ymin"), ("Y 最大端面", "ymax"), ("Z 最小端面", "zmin"), ("Z 最大端面", "zmax")]
 FACE_LABELS = {value: label for label, value in FACE_ITEMS}
@@ -278,7 +396,7 @@ class ResultTableDialog(QDialog):
         file_name, _ = QFileDialog.getSaveFileName(
             self,
             "导出结果表格 CSV",
-            str(PROJECT_ROOT / "data" / "results" / f"{default_name}.csv"),
+            str(RESULTS_DIR / f"{default_name}.csv"),
             "CSV File (*.csv)",
         )
         if not file_name:
@@ -352,7 +470,7 @@ class CAEMainWindow(QMainWindow):
         self.viewport_placeholder: Optional[QLabel] = None
         self.viewport: Optional[QtInteractor] = None
 
-        self.setWindowTitle("CAE 通用分析工作台 v0.9")
+        self.setWindowTitle("CAE 通用分析工作台 v1.0")
         self.resize(1820, 1040)
         self.setMinimumSize(1500, 920)
         self._build_ui()
@@ -466,9 +584,13 @@ class CAEMainWindow(QMainWindow):
 
         if self.viewport is not None or self.viewport_page is None or self.viewport_layout is None:
             return
+        if SKIP_VIEWPORT_INIT:
+            write_startup_trace("skip viewport initialization by environment flag")
+            return
 
         # 关闭 pyvistaqt 的自动刷新定时器，避免首屏阶段后台 render 抢先触发。
         # 当前界面在 add_mesh / clear / reset_camera 等操作后会主动刷新，足够满足需求。
+        write_startup_trace("begin viewport initialization")
         viewport = QtInteractor(self.viewport_page, auto_update=False, multi_samples=0)
         viewport.set_background("#D9E2EC", top="#243B53")
         viewport.add_axes()
@@ -481,6 +603,7 @@ class CAEMainWindow(QMainWindow):
 
         self.viewport_layout.addWidget(viewport.interactor)
         self.viewport = viewport
+        write_startup_trace("viewport initialization finished")
 
     def _has_viewport(self) -> bool:
         return self.viewport is not None
@@ -530,10 +653,17 @@ class CAEMainWindow(QMainWindow):
             QTimer.singleShot(120, self._deferred_startup_initialize)
             return
         self._startup_initialized = True
+        write_startup_trace("deferred startup initialization begin")
         try:
             self._initialize_viewport()
-            self.refresh_geometry_preview()
+            if SKIP_AUTO_PREVIEW:
+                write_startup_trace("skip automatic geometry preview by environment flag")
+            else:
+                write_startup_trace("begin automatic geometry preview")
+                self.refresh_geometry_preview()
+                write_startup_trace("automatic geometry preview finished")
         except Exception as exc:
+            write_startup_trace(f"deferred startup initialization failed: {exc}")
             self.log(f"启动阶段几何预览初始化失败：{exc}")
 
     def _task_running(self) -> bool:
@@ -2376,7 +2506,7 @@ class CAEMainWindow(QMainWindow):
         file_name, _ = QFileDialog.getSaveFileName(
             self,
             "导出分析报告",
-            str(PROJECT_ROOT / "data" / "results" / "analysis_report.md"),
+            str(RESULTS_DIR / "analysis_report.md"),
             "Markdown File (*.md)",
         )
         if not file_name:
@@ -2749,7 +2879,7 @@ class CAEMainWindow(QMainWindow):
         if not self.mesh_bundle:
             QMessageBox.warning(self, "没有网格", "请先生成网格。")
             return
-        file_name, _ = QFileDialog.getSaveFileName(self, "导出网格 VTU", str(PROJECT_ROOT / "data" / "models" / "latest_mesh.vtu"), "VTU File (*.vtu)")
+        file_name, _ = QFileDialog.getSaveFileName(self, "导出网格 VTU", str(MODELS_DIR / "latest_mesh.vtu"), "VTU File (*.vtu)")
         if file_name:
             export_mesh_to_vtk(self.mesh_bundle, file_name)
             self.log(f"网格已导出：{file_name}")
@@ -3055,7 +3185,7 @@ class CAEMainWindow(QMainWindow):
         file_name, _ = QFileDialog.getSaveFileName(
             self,
             "导出动力曲线 CSV",
-            str(PROJECT_ROOT / "data" / "results" / "transient_history.csv"),
+            str(RESULTS_DIR / "transient_history.csv"),
             "CSV File (*.csv)",
         )
         if not file_name:
@@ -3078,7 +3208,7 @@ class CAEMainWindow(QMainWindow):
         file_name, _ = QFileDialog.getSaveFileName(
             self,
             "导出频响曲线 CSV",
-            str(PROJECT_ROOT / "data" / "results" / "frequency_response.csv"),
+            str(RESULTS_DIR / "frequency_response.csv"),
             "CSV File (*.csv)",
         )
         if not file_name:
@@ -3090,7 +3220,7 @@ class CAEMainWindow(QMainWindow):
 
     def save_project(self) -> None:
         self._sync_state_from_widgets()
-        file_name, _ = QFileDialog.getSaveFileName(self, "保存项目", str(PROJECT_ROOT / "data" / "project_state.json"), "CAE Project (*.json)")
+        file_name, _ = QFileDialog.getSaveFileName(self, "保存项目", str(DATA_DIR / "project_state.json"), "CAE Project (*.json)")
         if file_name:
             path = Path(file_name)
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -3098,7 +3228,7 @@ class CAEMainWindow(QMainWindow):
             self.log(f"项目已保存：{path}")
 
     def load_project(self) -> None:
-        file_name, _ = QFileDialog.getOpenFileName(self, "打开项目", str(PROJECT_ROOT / "data"), "CAE Project (*.json)")
+        file_name, _ = QFileDialog.getOpenFileName(self, "打开项目", str(DATA_DIR), "CAE Project (*.json)")
         if file_name:
             path = Path(file_name)
             self.state = ProjectState.from_dict(json.loads(path.read_text(encoding="utf-8")))
@@ -3114,7 +3244,7 @@ class CAEMainWindow(QMainWindow):
         if not self.analysis:
             QMessageBox.warning(self, "没有结果", "请先运行分析。")
             return
-        file_name, _ = QFileDialog.getSaveFileName(self, "导出结果 CSV", self.state.result_summary.export_file or str(PROJECT_ROOT / "data" / "results" / "export_results.csv"), "CSV File (*.csv)")
+        file_name, _ = QFileDialog.getSaveFileName(self, "导出结果 CSV", self.state.result_summary.export_file or str(RESULTS_DIR / "export_results.csv"), "CSV File (*.csv)")
         if file_name:
             self.analysis.solver.exportResults(file_name)
             self.state.result_summary.export_file = file_name
@@ -3125,7 +3255,7 @@ class CAEMainWindow(QMainWindow):
         if not self.analysis:
             QMessageBox.warning(self, "没有结果", "请先运行分析。")
             return
-        file_name, _ = QFileDialog.getSaveFileName(self, "导出结果 VTU", self.state.result_summary.export_vtk_file or str(PROJECT_ROOT / "data" / "results" / "export_results.vtu"), "VTU File (*.vtu)")
+        file_name, _ = QFileDialog.getSaveFileName(self, "导出结果 VTU", self.state.result_summary.export_vtk_file or str(RESULTS_DIR / "export_results.vtu"), "VTU File (*.vtu)")
         if file_name:
             self._current_result_grid(deformed=False, point_data=False).save(file_name)
             self.state.result_summary.export_vtk_file = file_name
@@ -3241,9 +3371,11 @@ class CAEMainWindow(QMainWindow):
 
 
 def main() -> None:
+    write_startup_trace("main entry")
     qInstallMessageHandler(qt_message_handler)
     pv.global_theme.allow_empty_mesh = True
     QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts, True)
+    write_startup_trace("create QApplication")
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     # 让 Ctrl+C / VSCode 停止按钮优雅退出 Qt 事件循环，避免控制台留下 KeyboardInterrupt traceback。
@@ -3253,8 +3385,11 @@ def main() -> None:
     signal_timer.timeout.connect(lambda: None)
     signal_timer.start()
     app._signal_timer = signal_timer  # type: ignore[attr-defined]
+    write_startup_trace("create main window")
     window = CAEMainWindow()
+    write_startup_trace("show main window")
     window.showMaximized()
+    write_startup_trace("enter Qt event loop")
     sys.exit(app.exec())
 
 

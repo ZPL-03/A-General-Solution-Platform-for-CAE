@@ -18,6 +18,9 @@ import numpy as np
 import pyvista as pv
 
 from app.models import MeshSummary, ProjectState
+from app.runtime_paths import bootstrap_runtime_environment, resolve_runtime_path
+
+bootstrap_runtime_environment()
 
 
 @dataclass
@@ -514,7 +517,9 @@ def generate_volume_mesh(state: ProjectState) -> MeshBundle:
         if state.geometry.optimize_mesh:
             gmsh.model.mesh.optimize("")
 
-        mesh_file = state.geometry.mesh_file
+        # 项目状态里可以保存相对路径；
+        # 这里统一解析到当前运行目录下，保证打包后的 EXE 也能稳定输出网格文件。
+        mesh_file = str(resolve_runtime_path(state.geometry.mesh_file))
         _ensure_parent_dir(mesh_file)
         gmsh.write(mesh_file)
 

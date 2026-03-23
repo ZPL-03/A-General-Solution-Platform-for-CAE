@@ -20,12 +20,19 @@ import numpy as np
 import pyvista as pv
 
 from app.models import ProjectState, ResultSummary
+from app.runtime_paths import APP_ROOT, bootstrap_runtime_environment, resolve_runtime_path
 from app.services.mesh_service import MeshBundle
 
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
+# 源码模式下，先把仓库内的 `python/` 目录加入搜索路径；
+# 打包模式下，再由 `bootstrap_runtime_environment()` 补齐 EXE 目录等候选路径。
+SOURCE_PROJECT_ROOT = Path(__file__).resolve().parents[3]
+SOURCE_PYTHON_ROOT = SOURCE_PROJECT_ROOT / "python"
+if str(SOURCE_PYTHON_ROOT) not in sys.path:
+    sys.path.insert(0, str(SOURCE_PYTHON_ROOT))
+
+bootstrap_runtime_environment()
+PROJECT_ROOT = APP_ROOT
 PYTHON_ROOT = PROJECT_ROOT / "python"
-if str(PYTHON_ROOT) not in sys.path:
-    sys.path.insert(0, str(PYTHON_ROOT))
 
 import fem_core  # noqa: E402
 
@@ -312,11 +319,11 @@ def _run_modal_analysis(
         state.solver.warp_factor,
     )
 
-    export_file = Path(state.solver.result_file)
+    export_file = resolve_runtime_path(state.solver.result_file)
     export_file.parent.mkdir(parents=True, exist_ok=True)
     solver.exportResults(str(export_file))
 
-    export_vtk_file = Path(state.solver.result_vtk_file)
+    export_vtk_file = resolve_runtime_path(state.solver.result_vtk_file)
     export_vtk_file.parent.mkdir(parents=True, exist_ok=True)
     result_grid.save(export_vtk_file)
 
@@ -406,11 +413,11 @@ def _run_transient_analysis(
         state.solver.warp_factor,
     )
 
-    export_file = Path(state.solver.result_file)
+    export_file = resolve_runtime_path(state.solver.result_file)
     export_file.parent.mkdir(parents=True, exist_ok=True)
     solver.exportResults(str(export_file))
 
-    export_vtk_file = Path(state.solver.result_vtk_file)
+    export_vtk_file = resolve_runtime_path(state.solver.result_vtk_file)
     export_vtk_file.parent.mkdir(parents=True, exist_ok=True)
     result_grid.save(export_vtk_file)
 
@@ -505,11 +512,11 @@ def _run_frequency_response_analysis(
         state.solver.warp_factor,
     )
 
-    export_file = Path(state.solver.result_file)
+    export_file = resolve_runtime_path(state.solver.result_file)
     export_file.parent.mkdir(parents=True, exist_ok=True)
     solver.exportResults(str(export_file))
 
-    export_vtk_file = Path(state.solver.result_vtk_file)
+    export_vtk_file = resolve_runtime_path(state.solver.result_vtk_file)
     export_vtk_file.parent.mkdir(parents=True, exist_ok=True)
     result_grid.save(export_vtk_file)
 
@@ -603,7 +610,7 @@ def _run_steady_state_thermal_analysis(
         heat_flux_array=heat_flux_array,
     )
 
-    export_file = Path(state.solver.result_file)
+    export_file = resolve_runtime_path(state.solver.result_file)
     export_file.parent.mkdir(parents=True, exist_ok=True)
     with open(export_file, "w", encoding="utf-8", newline="") as handle:
         handle.write("NodeID,X,Y,Z,Temperature\n")
@@ -615,7 +622,7 @@ def _run_steady_state_thermal_analysis(
         for element_id, value in enumerate(heat_flux_array):
             handle.write(f"{element_id},{value}\n")
 
-    export_vtk_file = Path(state.solver.result_vtk_file)
+    export_vtk_file = resolve_runtime_path(state.solver.result_vtk_file)
     export_vtk_file.parent.mkdir(parents=True, exist_ok=True)
     result_grid.save(export_vtk_file)
 
@@ -778,11 +785,11 @@ def run_linear_static_analysis(mesh_bundle: MeshBundle, state: ProjectState) -> 
         state.solver.warp_factor,
     )
 
-    export_file = Path(state.solver.result_file)
+    export_file = resolve_runtime_path(state.solver.result_file)
     export_file.parent.mkdir(parents=True, exist_ok=True)
     solver.exportResults(str(export_file))
 
-    export_vtk_file = Path(state.solver.result_vtk_file)
+    export_vtk_file = resolve_runtime_path(state.solver.result_vtk_file)
     export_vtk_file.parent.mkdir(parents=True, exist_ok=True)
     result_grid.save(export_vtk_file)
 

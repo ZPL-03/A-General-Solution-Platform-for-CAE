@@ -22,3 +22,9 @@ __pycache__/
 # 保留历史版本目录，但忽略其中生成的构建内容
 legacy/src_core_build_legacy/
 legacy/src_release_legacy/
+
+# 数据文件
+data/models/*.msh
+data/results/*.csv
+data/results/*.vtu
+

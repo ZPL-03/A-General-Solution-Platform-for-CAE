@@ -12,7 +12,6 @@ from __future__ import annotations
 from datetime import datetime
 
 from app.models import ProjectState
-from app.services.solver_service import describe_dynamic_damping
 
 
 def _section(title: str, lines: list[str]) -> str:
@@ -27,6 +26,10 @@ def build_markdown_report(
     solver_label: str,
 ) -> str:
     """根据当前项目状态生成 Markdown 报告文本。"""
+
+    # 报告导出不是高频启动路径。
+    # 这里延迟导入求解服务，避免桌面软件启动阶段就加载 `fem_core` 等原生模块。
+    from app.services.solver_service import describe_dynamic_damping
 
     state.ensure_default_entities()
     mesh = state.mesh_summary
