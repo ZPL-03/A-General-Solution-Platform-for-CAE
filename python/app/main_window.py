@@ -19,8 +19,8 @@ if sys.platform.startswith("win"):
 warnings.filterwarnings("ignore", message="sipPyTypeDict\\(\\) is deprecated", category=DeprecationWarning)
 
 import numpy as np
-from PyQt6.QtCore import QEvent, QObject, QSize, Qt, QThread, QTimer, pyqtSignal, qInstallMessageHandler
-from PyQt6.QtGui import QAction
+from PyQt6.QtCore import QEvent, QObject, QPointF, QSize, Qt, QThread, QTimer, pyqtSignal, qInstallMessageHandler
+from PyQt6.QtGui import QAction, QMouseEvent
 from PyQt6.QtWidgets import QApplication, QCheckBox, QComboBox, QDialog, QDockWidget, QDoubleSpinBox, QFileDialog, QFormLayout, QFrame, QGroupBox, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QMainWindow, QMessageBox, QPlainTextEdit, QPushButton, QSpinBox, QStackedWidget, QStatusBar, QStyle, QTableWidget, QTableWidgetItem, QTextBrowser, QToolBar, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
@@ -97,6 +97,10 @@ def describe_dynamic_damping(state: ProjectState) -> str:
 
     return _solver_service().describe_dynamic_damping(state)
 
+def get_analysis_artifacts_type():
+    """延迟获取求解结果对象类型，避免主窗口导入时过早加载求解模块。"""
+
+    return _solver_service().AnalysisArtifacts
 
 GENERIC_LINEAR_SOLVER_OPTIONS = [
     ("SparseLU 直接法", "sparse_lu"),
@@ -445,6 +449,8 @@ class CAEMainWindow(QMainWindow):
         self.boundary_pick_actor_refs: dict[str, object] = {}
         self.boundary_pick_hover_face: str = ""
         self.pick_press_position: Optional[tuple[float, float]] = None
+        self.pick_press_modifiers = Qt.KeyboardModifier.NoModifier
+        self.pick_drag_active = False
         self.result_probe_enabled = False
         self.result_probe_marker_actor = None
         self.result_probe_hover_actor = None
@@ -1957,13 +1963,297 @@ class CAEMainWindow(QMainWindow):
         i_size, j_size = plane_sizes[face_name]
         return pv.Plane(center=center, direction=tuple(normal.tolist()), i_size=i_size, j_size=j_size, i_resolution=1, j_resolution=1)
 
+    def _resolve_visual_surface_patch(
+        self,
+        face_name: str,
+        bounds: tuple[float, float, float, float, float, float],
+        offset_ratio: float = 0.004,
+    ) -> Optional[pv.PolyData]:
+        """
+        返回当前需要显示的表面补丁。
+
+        说明：
+        1. 优先使用真实几何面 `surface:*`；
+        2. 若当前状态里保存的是兼容端面名称，则退回到包围盒平面；
+        3. 这样旧项目或未启用真实选面时也能正常显示标注。
+        """
+
+        surface_patches, _surface_labels = self._get_current_surface_patches()
+        if face_name in surface_patches:
+            return surface_patches[face_name]
+        if face_name in FACE_LABELS:
+            return self._build_face_plane(face_name, bounds, offset_ratio=offset_ratio)
+        return None
+
+    def _surface_display_normal(
+        self,
+        face_name: str,
+        surface_patch: pv.PolyData,
+        bounds: tuple[float, float, float, float, float, float],
+    ) -> np.ndarray:
+        """
+        估算当前显示补丁的外法向。
+
+        说明：
+        1. 对标准端面名称，直接使用包围盒法向；
+        2. 对真实 CAD/网格面，使用平均单元法向并按模型中心修正朝向；
+        3. 这样载荷箭头和约束符号都能尽量贴合真实选中面。
+        """
+
+        if face_name in FACE_LABELS:
+            _center, normal = self._face_center_and_normal(face_name, bounds)
+            return normal
+
+        normal_patch = surface_patch.compute_normals(
+            cell_normals=True,
+            point_normals=False,
+            auto_orient_normals=True,
+            consistent_normals=True,
+        )
+        normals = np.asarray(normal_patch.cell_normals, dtype=float)
+        if normals.size == 0:
+            normals = np.asarray([[0.0, 0.0, 1.0]], dtype=float)
+        normal = np.mean(normals, axis=0)
+
+        patch_points = np.asarray(surface_patch.points, dtype=float)
+        patch_center = np.mean(patch_points, axis=0) if patch_points.size else np.zeros(3, dtype=float)
+        model_center = np.array(
+            [
+                0.5 * (bounds[0] + bounds[1]),
+                0.5 * (bounds[2] + bounds[3]),
+                0.5 * (bounds[4] + bounds[5]),
+            ],
+            dtype=float,
+        )
+        outward_hint = patch_center - model_center
+        if np.linalg.norm(normal) <= 1.0e-12:
+            normal = outward_hint if np.linalg.norm(outward_hint) > 1.0e-12 else np.array([0.0, 0.0, 1.0], dtype=float)
+        if np.linalg.norm(outward_hint) > 1.0e-12 and float(np.dot(normal, outward_hint)) < 0.0:
+            normal = -normal
+
+        length = float(np.linalg.norm(normal))
+        if length <= 1.0e-12:
+            return np.array([0.0, 0.0, 1.0], dtype=float)
+        return normal / length
+
+    def _surface_anchor_point(self, surface_patch: pv.PolyData) -> np.ndarray:
+        """返回当前表面用于放置主标记的中心点。"""
+
+        centers = np.asarray(surface_patch.cell_centers().points, dtype=float)
+        if centers.ndim != 2 or centers.shape[0] == 0:
+            centers = np.asarray(surface_patch.points, dtype=float)
+        if centers.ndim != 2 or centers.shape[0] == 0:
+            return np.zeros(3, dtype=float)
+        return np.mean(centers, axis=0)
+
+    def _surface_symbol_anchor(
+        self,
+        face_name: str,
+        surface_patch: pv.PolyData,
+        bounds: tuple[float, float, float, float, float, float],
+    ) -> np.ndarray:
+        """
+        返回用于绘制边界/荷载符号的真实锚点。
+
+        说明：
+        1. 对标准端面，直接返回实体真实端面的中心，而不是外移后的高亮平面中心；
+        2. 对真实选中的几何面，优先使用面包围盒中心，避免单元中心平均导致视觉偏移；
+        3. 这样可把“高亮显示层”和“符号起点”解耦，减少箭头与所选面中心不重合的问题。
+        """
+
+        if face_name in FACE_LABELS:
+            center, _normal = self._face_center_and_normal(face_name, bounds)
+            return center
+        patch_bounds = surface_patch.bounds
+        return np.array(
+            [
+                0.5 * (patch_bounds[0] + patch_bounds[1]),
+                0.5 * (patch_bounds[2] + patch_bounds[3]),
+                0.5 * (patch_bounds[4] + patch_bounds[5]),
+            ],
+            dtype=float,
+        )
+
+    def _surface_tangent_basis(self, normal: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """根据表面法向构造两个互相正交的面内切向基。"""
+
+        direction = np.asarray(normal, dtype=float)
+        length = float(np.linalg.norm(direction))
+        if length <= 1.0e-12:
+            direction = np.array([0.0, 0.0, 1.0], dtype=float)
+        else:
+            direction = direction / length
+
+        reference = np.array([0.0, 0.0, 1.0], dtype=float)
+        if abs(float(np.dot(direction, reference))) > 0.9:
+            reference = np.array([0.0, 1.0, 0.0], dtype=float)
+
+        tangent_1 = np.cross(direction, reference)
+        tangent_1_norm = float(np.linalg.norm(tangent_1))
+        if tangent_1_norm <= 1.0e-12:
+            tangent_1 = np.array([1.0, 0.0, 0.0], dtype=float)
+        else:
+            tangent_1 = tangent_1 / tangent_1_norm
+
+        tangent_2 = np.cross(direction, tangent_1)
+        tangent_2_norm = float(np.linalg.norm(tangent_2))
+        if tangent_2_norm <= 1.0e-12:
+            tangent_2 = np.array([0.0, 1.0, 0.0], dtype=float)
+        else:
+            tangent_2 = tangent_2 / tangent_2_norm
+        return tangent_1, tangent_2
+
+    def _surface_marker_points(self, surface_patch: pv.PolyData, max_points: int = 4) -> np.ndarray:
+        """返回一个用于放置箭头/约束符号的代表性点集。"""
+
+        centers = np.asarray(surface_patch.cell_centers().points, dtype=float)
+        if centers.ndim != 2 or centers.shape[0] == 0:
+            centers = np.asarray(surface_patch.points, dtype=float)
+        if centers.ndim != 2 or centers.shape[0] == 0:
+            return np.empty((0, 3), dtype=float)
+        if centers.shape[0] <= max_points:
+            return centers
+        pick_indices = np.linspace(0, centers.shape[0] - 1, num=max_points, dtype=int)
+        return centers[pick_indices]
+
+    def _add_slim_arrow(
+        self,
+        start: np.ndarray,
+        direction: np.ndarray,
+        length: float,
+        color: str,
+        shaft_radius: float,
+        tip_radius: float,
+        tip_length: float,
+        opacity: float = 0.95,
+    ) -> None:
+        """绘制一根更细、更克制的箭头标记。"""
+
+        if not self._has_viewport():
+            return
+        vector = np.asarray(direction, dtype=float)
+        vector_norm = float(np.linalg.norm(vector))
+        if vector_norm <= 1.0e-12 or length <= 1.0e-12:
+            return
+        vector = vector / vector_norm
+
+        arrow = pv.Arrow(
+            start=np.asarray(start, dtype=float),
+            direction=vector,
+            tip_length=min(max(tip_length / length, 0.18), 0.45),
+            tip_radius=max(tip_radius / length, 0.04),
+            shaft_radius=max(shaft_radius / length, 0.015),
+            scale=length,
+        )
+        self.viewport.add_mesh(arrow, color=color, opacity=opacity, smooth_shading=True)
+
+    def _add_structural_boundary_symbols(
+        self,
+        boundary_patch: pv.PolyData,
+        face_name: str,
+        bounds: tuple[float, float, float, float, float, float],
+        size: float,
+    ) -> None:
+        """在约束面上添加更轻量、更清晰的边界条件符号。"""
+
+        normal = self._surface_display_normal(face_name, boundary_patch, bounds)
+        anchor = self._surface_symbol_anchor(face_name, boundary_patch, bounds)
+        tangent_1, tangent_2 = self._surface_tangent_basis(normal)
+
+        cone_height = 0.060 * size
+        cone_radius = 0.014 * size
+        support_offsets = [(-0.040 * size) * tangent_1, (0.040 * size) * tangent_1]
+        for offset in support_offsets:
+            cone_center = anchor + offset + normal * (0.5 * cone_height)
+            support_cone = pv.Cone(
+                center=cone_center,
+                direction=-normal,
+                height=cone_height,
+                radius=cone_radius,
+                resolution=18,
+            )
+            self.viewport.add_mesh(support_cone, color="#2563EB", opacity=0.90, smooth_shading=True)
+
+        axis_markers = [
+            (
+                self.state.boundary_condition.constrain_x,
+                np.array([1.0, 0.0, 0.0], dtype=float),
+                "#DC2626",
+                -0.026 * size * tangent_2,
+            ),
+            (
+                self.state.boundary_condition.constrain_y,
+                np.array([0.0, 1.0, 0.0], dtype=float),
+                "#16A34A",
+                np.zeros(3, dtype=float),
+            ),
+            (
+                self.state.boundary_condition.constrain_z,
+                np.array([0.0, 0.0, 1.0], dtype=float),
+                "#2563EB",
+                0.026 * size * tangent_2,
+            ),
+        ]
+        axis_length = 0.075 * size
+        for enabled, axis, color, offset in axis_markers:
+            if not enabled:
+                continue
+            arrow_start = anchor + offset + normal * (0.040 * size) - 0.5 * axis_length * axis
+            self._add_slim_arrow(
+                arrow_start,
+                axis,
+                axis_length,
+                color,
+                shaft_radius=0.0035 * size,
+                tip_radius=0.0085 * size,
+                tip_length=0.020 * size,
+                opacity=0.92,
+            )
+
+    def _add_structural_load_symbols(
+        self,
+        load_patch: pv.PolyData,
+        face_name: str,
+        load_vector: np.ndarray,
+        bounds: tuple[float, float, float, float, float, float],
+        size: float,
+    ) -> None:
+        """把载荷箭头简化为单根细箭头，并稳定贴在选中的面附近。"""
+
+        anchor = self._surface_symbol_anchor(face_name, load_patch, bounds)
+        normal = self._surface_display_normal(face_name, load_patch, bounds)
+        load_magnitude = float(np.linalg.norm(load_vector))
+        if load_magnitude <= 0.0:
+            marker_center = anchor
+            marker = pv.Sphere(radius=0.018 * size, center=marker_center)
+            self.viewport.add_mesh(marker, color="#F59E0B", opacity=0.88, smooth_shading=True)
+            return
+
+        direction = load_vector / load_magnitude
+        arrow_length = 0.220 * size
+        arrow_start = anchor
+        base_marker = pv.Sphere(radius=0.010 * size, center=arrow_start)
+        self.viewport.add_mesh(base_marker, color="#DC2626", opacity=0.96, smooth_shading=True)
+        self._add_slim_arrow(
+            arrow_start,
+            direction,
+            arrow_length,
+            "#DC2626",
+            shaft_radius=0.0052 * size,
+            tip_radius=0.013 * size,
+            tip_length=0.040 * size,
+            opacity=0.96,
+        )
+
     def _add_condition_visuals(self) -> None:
         """在视口中显示当前边界条件和载荷的可视化标注。"""
 
         if not self._has_viewport():
             return
+        if self.boundary_pick_mode is not None:
+            return
         module_index = self._current_module_index()
-        if module_index not in {2, 3} or self.boundary_pick_mode is not None:
+        if module_index not in {2, 3}:
             return
 
         bounds = self._current_scene_bounds()
@@ -1971,88 +2261,92 @@ class CAEMainWindow(QMainWindow):
             return
 
         size = max(bounds[1] - bounds[0], bounds[3] - bounds[2], bounds[5] - bounds[4], 1.0e-6)
-        surface_patches, _surface_labels = self._get_current_surface_patches()
+        show_structural = module_index == 2 and (self.state.boundary_condition.is_applied or self.state.load_case.is_applied)
+        show_thermal = module_index == 3 and (self.state.thermal_boundary.is_applied or self.state.thermal_load.is_applied)
 
-        if module_index == 2:
+        if show_structural:
             boundary_face = self.state.boundary_condition.target_face
-            if self.state.boundary_condition.is_applied and boundary_face in surface_patches:
-                boundary_patch = surface_patches[boundary_face]
+            boundary_patch = (
+                self._resolve_visual_surface_patch(boundary_face, bounds)
+                if self.state.boundary_condition.is_applied and boundary_face
+                else None
+            )
+            if boundary_patch is not None:
                 self.viewport.add_mesh(
                     boundary_patch,
                     color="#60A5FA",
-                    opacity=0.45,
+                    opacity=0.20,
                     show_edges=False,
                     smooth_shading=True,
                 )
                 self.viewport.add_mesh(
                     boundary_patch.extract_feature_edges(boundary_edges=True, feature_edges=False, manifold_edges=False),
                     color="#2563EB",
-                    line_width=3.0,
+                    line_width=2.0,
                 )
+                self._add_structural_boundary_symbols(boundary_patch, boundary_face, bounds, size)
 
             load_face = self.state.load_case.loaded_face
             load_vector = np.array(
                 [self.state.load_case.force_x, self.state.load_case.force_y, self.state.load_case.force_z],
                 dtype=float,
             )
-            load_magnitude = float(np.linalg.norm(load_vector))
-            if self.state.load_case.is_applied and load_face in surface_patches:
-                load_patch = surface_patches[load_face]
+            load_patch = self._resolve_visual_surface_patch(load_face, bounds) if self.state.load_case.is_applied and load_face else None
+            if load_patch is not None:
                 self.viewport.add_mesh(
                     load_patch,
                     color="#FBBF24",
-                    opacity=0.35,
+                    opacity=0.18,
                     show_edges=False,
                     smooth_shading=True,
                 )
                 self.viewport.add_mesh(
                     load_patch.extract_feature_edges(boundary_edges=True, feature_edges=False, manifold_edges=False),
                     color="#EA580C",
-                    line_width=3.0,
+                    line_width=2.0,
                 )
-                center = np.mean(np.asarray(load_patch.points), axis=0)
-                if load_magnitude > 0.0:
-                    direction = load_vector / load_magnitude
-                    arrow_length = 0.22 * size
-                    arrow_start = center - direction * (0.12 * size)
-                    load_arrow = pv.Arrow(start=arrow_start, direction=direction, scale=arrow_length)
-                    self.viewport.add_mesh(load_arrow, color="#DC2626", smooth_shading=True)
-                else:
-                    marker = pv.Sphere(radius=0.018 * size, center=center)
-                    self.viewport.add_mesh(marker, color="#F59E0B", smooth_shading=True)
-            return
+                self._add_structural_load_symbols(load_patch, load_face, load_vector, bounds, size)
 
-        thermal_boundary_face = self.state.thermal_boundary.target_face
-        if self.state.thermal_boundary.is_applied and thermal_boundary_face in surface_patches:
-            boundary_patch = surface_patches[thermal_boundary_face]
-            self.viewport.add_mesh(
-                boundary_patch,
-                color="#C084FC",
-                opacity=0.42,
-                show_edges=False,
-                smooth_shading=True,
+        if show_thermal:
+            thermal_boundary_face = self.state.thermal_boundary.target_face
+            boundary_patch = (
+                self._resolve_visual_surface_patch(thermal_boundary_face, bounds)
+                if self.state.thermal_boundary.is_applied and thermal_boundary_face
+                else None
             )
-            self.viewport.add_mesh(
-                boundary_patch.extract_feature_edges(boundary_edges=True, feature_edges=False, manifold_edges=False),
-                color="#7C3AED",
-                line_width=3.0,
-            )
+            if boundary_patch is not None:
+                self.viewport.add_mesh(
+                    boundary_patch,
+                    color="#C084FC",
+                    opacity=0.22,
+                    show_edges=False,
+                    smooth_shading=True,
+                )
+                self.viewport.add_mesh(
+                    boundary_patch.extract_feature_edges(boundary_edges=True, feature_edges=False, manifold_edges=False),
+                    color="#7C3AED",
+                    line_width=2.0,
+                )
 
-        thermal_load_face = self.state.thermal_load.target_face
-        if self.state.thermal_load.is_applied and thermal_load_face in surface_patches:
-            load_patch = surface_patches[thermal_load_face]
-            self.viewport.add_mesh(
-                load_patch,
-                color="#F87171",
-                opacity=0.30,
-                show_edges=False,
-                smooth_shading=True,
+            thermal_load_face = self.state.thermal_load.target_face
+            load_patch = (
+                self._resolve_visual_surface_patch(thermal_load_face, bounds)
+                if self.state.thermal_load.is_applied and thermal_load_face
+                else None
             )
-            self.viewport.add_mesh(
-                load_patch.extract_feature_edges(boundary_edges=True, feature_edges=False, manifold_edges=False),
-                color="#B91C1C",
-                line_width=3.0,
-            )
+            if load_patch is not None:
+                self.viewport.add_mesh(
+                    load_patch,
+                    color="#F87171",
+                    opacity=0.18,
+                    show_edges=False,
+                    smooth_shading=True,
+                )
+                self.viewport.add_mesh(
+                    load_patch.extract_feature_edges(boundary_edges=True, feature_edges=False, manifold_edges=False),
+                    color="#B91C1C",
+                    line_width=2.0,
+                )
 
     def _current_result_grid(self, deformed: bool = True, point_data: bool = False) -> pv.DataSet:
         """根据当前变形倍数返回用于显示的结果网格。"""
@@ -2090,6 +2384,30 @@ class CAEMainWindow(QMainWindow):
             "heat_flux": "inferno",
         }[mode]
         return title, cmap
+
+    def _build_mouse_event(
+        self,
+        event_type: QEvent.Type,
+        position: tuple[float, float],
+        button: Qt.MouseButton,
+        buttons: Qt.MouseButton,
+        modifiers: Qt.KeyboardModifier,
+    ) -> QMouseEvent:
+        """根据记录的鼠标状态重建一个 Qt 鼠标事件，用于转发给视口。"""
+
+        return QMouseEvent(event_type, QPointF(float(position[0]), float(position[1])), button, buttons, modifiers)
+
+    def _dispatch_viewport_mouse_event(self, event: QMouseEvent) -> None:
+        """把延迟判定后的鼠标事件手动转发给视口控件。"""
+
+        if not self._has_viewport():
+            return
+        if event.type() == QEvent.Type.MouseButtonPress:
+            self.viewport.interactor.mousePressEvent(event)
+        elif event.type() == QEvent.Type.MouseMove:
+            self.viewport.interactor.mouseMoveEvent(event)
+        elif event.type() == QEvent.Type.MouseButtonRelease:
+            self.viewport.interactor.mouseReleaseEvent(event)
 
     def _current_curve_response_key(self) -> str:
         """返回当前曲线窗口选中的响应量类型。"""
@@ -2145,21 +2463,62 @@ class CAEMainWindow(QMainWindow):
             if event.type() == QEvent.Type.MouseButtonPress and getattr(event, "button", lambda: None)() == Qt.MouseButton.LeftButton:
                 position = event.position()
                 self.pick_press_position = (position.x(), position.y())
+                self.pick_press_modifiers = event.modifiers()
+                self.pick_drag_active = False
+                return True
             elif event.type() == QEvent.Type.MouseMove:
                 position = event.position()
                 self._update_boundary_face_hover(position.x(), position.y())
+                buttons = getattr(event, "buttons", lambda: Qt.MouseButton.NoButton)()
+                if self.pick_press_position is not None and bool(buttons & Qt.MouseButton.LeftButton):
+                    dx = position.x() - self.pick_press_position[0]
+                    dy = position.y() - self.pick_press_position[1]
+                    if not self.pick_drag_active and dx * dx + dy * dy > 25.0:
+                        press_event = self._build_mouse_event(
+                            QEvent.Type.MouseButtonPress,
+                            self.pick_press_position,
+                            Qt.MouseButton.LeftButton,
+                            Qt.MouseButton.LeftButton,
+                            self.pick_press_modifiers,
+                        )
+                        self._dispatch_viewport_mouse_event(press_event)
+                        self.pick_drag_active = True
+                    if self.pick_drag_active:
+                        move_event = self._build_mouse_event(
+                            QEvent.Type.MouseMove,
+                            (position.x(), position.y()),
+                            Qt.MouseButton.NoButton,
+                            buttons,
+                            event.modifiers(),
+                        )
+                        self._dispatch_viewport_mouse_event(move_event)
+                        return True
+                    return True
             elif event.type() == QEvent.Type.MouseButtonRelease and getattr(event, "button", lambda: None)() == Qt.MouseButton.LeftButton:
                 position = event.position()
                 press = self.pick_press_position
+                drag_active = self.pick_drag_active
                 self.pick_press_position = None
-                if press is not None:
+                self.pick_drag_active = False
+                if drag_active:
+                    release_event = self._build_mouse_event(
+                        QEvent.Type.MouseButtonRelease,
+                        (position.x(), position.y()),
+                        Qt.MouseButton.LeftButton,
+                        getattr(event, "buttons", lambda: Qt.MouseButton.NoButton)(),
+                        event.modifiers(),
+                    )
+                    self._dispatch_viewport_mouse_event(release_event)
+                elif press is not None:
                     dx = position.x() - press[0]
                     dy = position.y() - press[1]
                     if dx * dx + dy * dy <= 25.0:
                         if self._pick_boundary_face_at_position(position.x(), position.y()):
                             return True
+                return True
             elif event.type() == QEvent.Type.Leave:
                 self.pick_press_position = None
+                self.pick_drag_active = False
                 self.boundary_pick_hover_face = ""
                 self._refresh_boundary_pick_overlay_styles()
         elif watched is self.viewport.interactor and self.result_probe_enabled and self.current_scene == "result":
@@ -2302,6 +2661,7 @@ class CAEMainWindow(QMainWindow):
         self.boundary_pick_mode = target
         self.boundary_pick_hover_face = ""
         self.pick_press_position = None
+        self.pick_drag_active = False
         self._redraw_current_scene()
         prompt_map = {
             "load": "受载面",
@@ -2310,7 +2670,7 @@ class CAEMainWindow(QMainWindow):
             "thermal_load": "热流作用表面",
         }
         prompt = prompt_map.get(target, "目标表面")
-        self.log(f"请在主视口中左键单击{prompt}完成选择；拖动鼠标只会旋转视图，不会误选。")
+        self.log(f"请在主视口中左键单击{prompt}完成选择；左键拖动可旋转视图，轻点会选面。")
 
     def _handle_boundary_face_pick(self, actor) -> bool:
         face_name = self.boundary_pick_actor_map.get(self._actor_key(actor))
@@ -2330,6 +2690,8 @@ class CAEMainWindow(QMainWindow):
             self.state.thermal_load.is_applied = False
         self.boundary_pick_mode = None
         self.boundary_pick_hover_face = ""
+        self.pick_press_position = None
+        self.pick_drag_active = False
         self._sync_widgets_from_state()
         self._redraw_current_scene()
         self.log(f"已通过图形方式选择表面：{self._surface_label(face_name)}")
@@ -2442,30 +2804,34 @@ class CAEMainWindow(QMainWindow):
         """右侧模块切换后，强制显示该模块对应的主视图。"""
 
         if index in (0, 1, 2, 3):
-            if self.preview_scene is not None and self.current_scene != "geometry":
+            if self.preview_scene is not None:
                 self._draw_geometry_scene()
             return
         if index == 4:
-            if self.mesh_bundle is not None and self.current_scene != "mesh":
+            if self.mesh_bundle is not None:
                 self._draw_quality_scene() if self.quality_bundle else self._draw_mesh_scene()
-            elif self.preview_scene is not None and self.current_scene != "geometry":
+            elif self.preview_scene is not None:
                 self._draw_geometry_scene()
             return
         if index == 5:
-            if self.mesh_bundle is not None and self.current_scene != "mesh":
+            if self.mesh_bundle is not None:
                 self._draw_quality_scene() if self.quality_bundle else self._draw_mesh_scene()
-            elif self.preview_scene is not None and self.current_scene != "geometry":
+            elif self.preview_scene is not None:
                 self._draw_geometry_scene()
             return
         if index == 6:
-            if self.analysis is not None and self.current_scene != "result":
-                self.restore_full_result()
-            elif self.mesh_bundle is not None and self.current_scene != "mesh":
+            if self.analysis is not None:
+                if self.current_scene == "result":
+                    self._redraw_current_scene()
+                else:
+                    self.restore_full_result()
+            elif self.mesh_bundle is not None:
                 self._draw_quality_scene() if self.quality_bundle else self._draw_mesh_scene()
-            elif self.preview_scene is not None and self.current_scene != "geometry":
+            elif self.preview_scene is not None:
                 self._draw_geometry_scene()
             return
         if index == 7:
+            self._redraw_current_scene()
             return
         self._redraw_current_scene()
 
@@ -3000,7 +3366,8 @@ class CAEMainWindow(QMainWindow):
         if not isinstance(result, tuple) or len(result) != 2:
             raise RuntimeError("后台求解返回了无法识别的结果对象。")
         state_snapshot, analysis = result
-        if not isinstance(state_snapshot, ProjectState) or not isinstance(analysis, AnalysisArtifacts):
+        analysis_artifacts_type = get_analysis_artifacts_type()
+        if not isinstance(state_snapshot, ProjectState) or not isinstance(analysis, analysis_artifacts_type):
             raise RuntimeError("后台求解返回对象类型不正确。")
 
         self.analysis = analysis

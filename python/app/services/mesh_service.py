@@ -391,6 +391,8 @@ def _extract_surface_patches(
         elem_types, elem_tags, elem_node_tags = gmsh.model.mesh.getElements(2, surface_tag)
         face_stream: list[int] = []
         patch_nodes: set[int] = set()
+        local_points: list[np.ndarray] = []
+        global_to_local: dict[int, int] = {}
 
         for array_index, elem_type in enumerate(elem_types):
             if elem_type not in supported_surface_types:
@@ -401,15 +403,22 @@ def _extract_surface_patches(
             for element_index in range(len(elem_tags[array_index])):
                 offset = element_index * nodes_per_element
                 corner_tags = nodes[offset: offset + corner_count]
-                cell_nodes = [tag_to_index[int(tag)] for tag in corner_tags]
-                face_stream.extend([corner_count, *cell_nodes])
-                patch_nodes.update(cell_nodes)
+                global_indices = [tag_to_index[int(tag)] for tag in corner_tags]
+                local_cell_nodes: list[int] = []
+                for global_index in global_indices:
+                    if global_index not in global_to_local:
+                        global_to_local[global_index] = len(local_points)
+                        local_points.append(points[global_index])
+                    local_cell_nodes.append(global_to_local[global_index])
+                face_stream.extend([corner_count, *local_cell_nodes])
+                patch_nodes.update(global_indices)
 
         if not face_stream:
             continue
 
         patch_key = f"surface:{surface_tag}"
-        surface_patches[patch_key] = pv.PolyData(points, np.array(face_stream, dtype=np.int64))
+        patch_points = np.asarray(local_points, dtype=float)
+        surface_patches[patch_key] = pv.PolyData(patch_points, np.array(face_stream, dtype=np.int64))
         surface_node_sets[patch_key] = sorted(patch_nodes)
         surface_labels[patch_key] = f"几何面-{surface_tag}"
 

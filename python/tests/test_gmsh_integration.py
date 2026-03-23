@@ -20,7 +20,7 @@ if str(PYTHON_ROOT) not in sys.path:
     sys.path.insert(0, str(PYTHON_ROOT))
 
 from app.models import ProjectState
-from app.services.mesh_service import compute_mesh_quality, export_mesh_to_vtk, generate_volume_mesh
+from app.services.mesh_service import build_geometry_preview, compute_mesh_quality, export_mesh_to_vtk, generate_volume_mesh
 from app.services.solver_service import describe_dynamic_damping, get_solver_options_for_analysis, normalize_solver_for_analysis, resolve_dynamic_rayleigh_coefficients, run_linear_static_analysis
 
 
@@ -74,6 +74,29 @@ def test_local_refinement_changes_mesh_density() -> None:
 
     assert refined_mesh.summary.node_count > coarse_mesh.summary.node_count
     assert refined_mesh.summary.tetra_count > coarse_mesh.summary.tetra_count
+
+
+def test_geometry_preview_surface_patches_are_individual_faces() -> None:
+    """验证几何预览中的真实选面补丁不会错误地退化成整个模型表面。"""
+
+    state = _make_state()
+    preview = build_geometry_preview(state)
+
+    assert len(preview.surface_patches) == 6
+    x_face_count = 0
+    y_face_count = 0
+    z_face_count = 0
+    for patch in preview.surface_patches.values():
+        bounds = patch.bounds
+        if np.isclose(bounds[0], bounds[1]):
+            x_face_count += 1
+        if np.isclose(bounds[2], bounds[3]):
+            y_face_count += 1
+        if np.isclose(bounds[4], bounds[5]):
+            z_face_count += 1
+    assert x_face_count == 2
+    assert y_face_count == 2
+    assert z_face_count == 2
 
 
 def test_nonlinear_static_service_entry() -> None:
