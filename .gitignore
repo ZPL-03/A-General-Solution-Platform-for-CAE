@@ -28,3 +28,5 @@ data/models/*.msh
 data/results/*.csv
 data/results/*.vtu
 
+# 本地最新项目备份
+legacy/
